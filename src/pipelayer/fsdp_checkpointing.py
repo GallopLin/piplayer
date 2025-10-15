@@ -274,25 +274,46 @@ class FSDPPipelinedStateLoader(PipelinedStateLoader):
         self.rank = rank
         self.world_size = world_size
         self.is_fsdp = isinstance(model, FSDP)
+        self.model = model
+        self.optimizer = optimizer
+        self.chkpt_dir = chkpt_dir
+        self.device = torch.device(device)
         
         # For FSDP models, we need to handle state dict loading differently
         # We'll collect the full state dict in chunks, then load it all at once
         # using FSDP's set_state_dict method
-        if self.is_fsdp and rank == 0:
+        if self.is_fsdp:
             # Only rank 0 loads from disk
-            self.accumulated_model_state = {}
-            self.accumulated_optim_state = {}
-        
-        # Initialize parent class
-        # Note: For FSDP, all ranks need to participate in the loading process
-        super().__init__(
-            model=model,
-            optimizer=optimizer,
-            chkpt_dir=chkpt_dir,
-            device=device,
-            host_queue_maxsize=host_queue_maxsize,
-            num_copy_workers=num_copy_workers,
-        )
+            if rank == 0:
+                self.accumulated_model_state = {}
+                self.accumulated_optim_state = {}
+                
+                # Initialize parent class only for rank 0
+                super().__init__(
+                    model=model,
+                    optimizer=optimizer,
+                    chkpt_dir=chkpt_dir,
+                    device=device,
+                    host_queue_maxsize=host_queue_maxsize,
+                    num_copy_workers=num_copy_workers,
+                )
+            else:
+                # Non-rank-0 processes don't load from disk
+                # They just participate in FSDP state dict loading
+                # Load metadata for num_chunks info
+                with open(os.path.join(chkpt_dir, "metadata.json"), "r", encoding="utf-8") as f:
+                    self.metadata = json.load(f)
+                self.num_chunks = int(self.metadata["num_chunks"])
+        else:
+            # Non-FSDP: use parent implementation for all ranks
+            super().__init__(
+                model=model,
+                optimizer=optimizer,
+                chkpt_dir=chkpt_dir,
+                device=device,
+                host_queue_maxsize=host_queue_maxsize,
+                num_copy_workers=num_copy_workers,
+            )
     
     def _apply_model_chunk(self, host_model_chunk: Dict[str, torch.Tensor]) -> None:
         """
@@ -344,14 +365,16 @@ class FSDPPipelinedStateLoader(PipelinedStateLoader):
         if not self.is_fsdp:
             return
         
-        if self.rank == 0:
-            # Rank 0: Load the accumulated state dict into the model
-            with FSDP.state_dict_type(
-                self.model,
-                StateDictType.FULL_STATE_DICT,
-                FullStateDictConfig(offload_to_cpu=False, rank0_only=False),
-                FullOptimStateDictConfig(offload_to_cpu=False, rank0_only=False),
-            ):
+        # Use rank0_only=True so only rank 0 provides the state dict
+        # FSDP will automatically broadcast it to other ranks
+        with FSDP.state_dict_type(
+            self.model,
+            StateDictType.FULL_STATE_DICT,
+            FullStateDictConfig(offload_to_cpu=False, rank0_only=True),
+            FullOptimStateDictConfig(offload_to_cpu=False, rank0_only=True),
+        ):
+            if self.rank == 0:
+                # Rank 0: Load the accumulated state dict into the model
                 # Load model state
                 self.model.load_state_dict(self.accumulated_model_state)
                 
@@ -364,18 +387,29 @@ class FSDPPipelinedStateLoader(PipelinedStateLoader):
                     FSDP.optim_state_dict_to_load(
                         self.model, self.optimizer, optim_state_dict
                     )
-            
-            # Clean up accumulated state to free memory
-            self.accumulated_model_state = {}
-            self.accumulated_optim_state = {}
-        else:
-            # Other ranks: participate in state dict loading
-            with FSDP.state_dict_type(
-                self.model,
-                StateDictType.FULL_STATE_DICT,
-                FullStateDictConfig(offload_to_cpu=False, rank0_only=False),
-                FullOptimStateDictConfig(offload_to_cpu=False, rank0_only=False),
-            ):
-                # Load empty state dict (data will be broadcast from rank 0)
-                self.model.load_state_dict({})
-                FSDP.optim_state_dict_to_load(self.model, self.optimizer, {})
+                
+                # Clean up accumulated state to free memory
+                self.accumulated_model_state = {}
+                self.accumulated_optim_state = {}
+    
+    def wait_for_chunk(self, chunk_idx: int) -> None:
+        """Wait for a specific chunk to be loaded."""
+        if self.is_fsdp and self.rank != 0:
+            # Non-rank-0 FSDP processes don't load chunks
+            return
+        super().wait_for_chunk(chunk_idx)
+    
+    def is_chunk_loaded(self, chunk_idx: int) -> bool:
+        """Check if a specific chunk is loaded."""
+        if self.is_fsdp and self.rank != 0:
+            # Non-rank-0 FSDP processes don't load chunks
+            # Return True to indicate they don't need to wait
+            return True
+        return super().is_chunk_loaded(chunk_idx)
+    
+    def stop(self) -> None:
+        """Stop the loader and clean up resources."""
+        if self.is_fsdp and self.rank != 0:
+            # Non-rank-0 FSDP processes don't have a loader to stop
+            return
+        super().stop()
