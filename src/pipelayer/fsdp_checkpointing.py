@@ -361,6 +361,15 @@ class FSDPPipelinedStateLoader(PipelinedStateLoader):
         
         This method should be called after all chunks are loaded.
         It applies the accumulated state dict to the FSDP model.
+        
+        IMPORTANT: When using FSDP with rank0_only=True in the state_dict_type context,
+        ALL ranks must call load_state_dict() within the context manager. Rank 0 provides
+        the actual state dict (loaded from disk), while other ranks provide empty dicts.
+        FSDP's context manager handles broadcasting the state from rank 0 to all ranks.
+        
+        This is a critical requirement of FSDP's loading mechanism - if only rank 0
+        calls load_state_dict(), other ranks will not receive the broadcasted state and
+        will have uninitialized parameters, causing the "Missing key(s)" error.
         """
         if not self.is_fsdp:
             return
@@ -375,6 +384,7 @@ class FSDPPipelinedStateLoader(PipelinedStateLoader):
         ):
             # ALL ranks must call load_state_dict within the context manager
             # Rank 0 provides the actual state dict, others provide empty dict
+            # This pattern is required by FSDP for proper state broadcasting
             if self.rank == 0:
                 model_state_to_load = self.accumulated_model_state
                 optim_state_to_load = self.accumulated_optim_state
