@@ -373,22 +373,31 @@ class FSDPPipelinedStateLoader(PipelinedStateLoader):
             FullStateDictConfig(offload_to_cpu=False, rank0_only=True),
             FullOptimStateDictConfig(offload_to_cpu=False, rank0_only=True),
         ):
+            # ALL ranks must call load_state_dict within the context manager
+            # Rank 0 provides the actual state dict, others provide empty dict
             if self.rank == 0:
-                # Rank 0: Load the accumulated state dict into the model
-                # Load model state
-                self.model.load_state_dict(self.accumulated_model_state)
-                
-                # Load optimizer state
-                if self.accumulated_optim_state:
-                    optim_state_dict = {
-                        "state": self.accumulated_optim_state,
-                        "param_groups": self.optimizer.param_groups,
-                    }
-                    FSDP.optim_state_dict_to_load(
-                        self.model, self.optimizer, optim_state_dict
-                    )
-                
-                # Clean up accumulated state to free memory
+                model_state_to_load = self.accumulated_model_state
+                optim_state_to_load = self.accumulated_optim_state
+            else:
+                model_state_to_load = {}
+                optim_state_to_load = {}
+            
+            # Load model state (all ranks must call this)
+            self.model.load_state_dict(model_state_to_load)
+            
+            # Load optimizer state (all ranks must call this)
+            if self.rank == 0 and optim_state_to_load:
+                optim_state_dict = {
+                    "state": optim_state_to_load,
+                    "param_groups": self.optimizer.param_groups,
+                }
+                loaded_optim_state = FSDP.optim_state_dict_to_load(
+                    self.model, self.optimizer, optim_state_dict
+                )
+                self.optimizer.load_state_dict(loaded_optim_state)
+            
+            # Clean up accumulated state to free memory (rank 0 only has this)
+            if self.rank == 0:
                 self.accumulated_model_state = {}
                 self.accumulated_optim_state = {}
     
