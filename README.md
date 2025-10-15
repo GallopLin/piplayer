@@ -4,12 +4,14 @@ Pipelayer 提供以下能力：
 - 将 PyTorch 模型与优化器状态分块保存（默认 50MB 为目标 chunk 大小）。
 - 使用独立的 IO 线程与复制工作线程，从 CPU pinned 内存向设备侧（CUDA 或 CPU 回退）进行非阻塞状态加载。
 - 提供 PipelayerModelWrapper 在加载过程中分块等待、逐步可用，加载完成后自动切换到原始 forward。
+- **NEW**: 支持 PyTorch FSDP（Fully Sharded Data Parallel）单机多卡训练场景。
 
 特性亮点：
 - 面向大模型训练检查点的快启、流水化 IO/拷贝。
 - 优化器状态与参数名对齐，便于恢复优化器。
 - 事件与流的正确同步，避免 CUDA 隐式同步导致的性能回退。
 - CPU 回退路径（无 CUDA 环境也可运行和测试）。
+- **FSDP 支持**：在单机多卡场景下保存和加载 FSDP 模型检查点，同时保留 pipelayer 核心哲学。
 
 ## 安装
 
@@ -65,6 +67,105 @@ wrapped = PipelayerModelWrapper(model=nn.Sequential(nn.Linear(128, 256), nn.ReLU
 x = torch.randn(4, 128)
 y = wrapped(x)  # 加载过程中会按需等待参数所在 chunk
 ```
+
+## FSDP 支持（单机多卡）
+
+Pipelayer 现已支持 PyTorch FSDP，允许在单机多卡场景下使用流水线加载检查点。
+
+### FSDP 快速上手
+
+```python
+import torch
+import torch.nn as nn
+from torch.optim import Adam
+import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+from pipelayer import save_fsdp_model_chunked, FSDPPipelinedStateLoader, FSDPPipelayerModelWrapper
+
+# 初始化分布式环境
+dist.init_process_group("nccl")
+rank = dist.get_rank()
+world_size = dist.get_world_size()
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+# 创建模型并用 FSDP 包装
+model = nn.Sequential(nn.Linear(128, 256), nn.ReLU(), nn.Linear(256, 10))
+model = FSDP(model, device_id=local_rank)
+
+# 创建优化器（必须在 FSDP 包装后）
+optimizer = Adam(model.parameters(), lr=1e-3)
+
+# 保存 FSDP 检查点（仅 rank 0 保存）
+num_chunks = save_fsdp_model_chunked(
+    model=model,
+    optimizer=optimizer,
+    save_dir="./fsdp_chkpt",
+    target_chunk_bytes=50 * 1024 * 1024,
+    rank=rank,
+)
+
+# 加载检查点方式 1：使用 FSDPPipelinedStateLoader
+loader = FSDPPipelinedStateLoader(
+    model=model,
+    optimizer=optimizer,
+    chkpt_dir="./fsdp_chkpt",
+    device=f"cuda:{local_rank}",
+    rank=rank,
+    world_size=world_size,
+)
+
+# 等待所有 chunk 加载完成
+for i in range(loader.num_chunks):
+    loader.wait_for_chunk(i)
+
+# 完成 FSDP 加载（重要！）
+loader.finalize_fsdp_loading()
+loader.stop()
+
+# 加载检查点方式 2：使用 FSDPPipelayerModelWrapper
+wrapper = FSDPPipelayerModelWrapper(
+    model=model,
+    optimizer=optimizer,
+    chkpt_dir="./fsdp_chkpt",
+    load_checkpoint=True,
+    device=f"cuda:{local_rank}",
+    rank=rank,
+    world_size=world_size,
+)
+
+# 可以直接使用 wrapper，它会自动处理加载和切换
+x = torch.randn(4, 128, device=f"cuda:{local_rank}")
+y = wrapper(x)
+```
+
+### 运行 FSDP 示例
+
+```bash
+# 单 GPU 测试（不使用实际 FSDP）
+python examples/fsdp_example.py
+
+# 多 GPU（例如 2 卡）
+torchrun --nproc_per_node=2 examples/fsdp_example.py
+```
+
+### FSDP 设计要点
+
+1. **保存时**：
+   - 所有 rank 参与状态字典收集
+   - 仅 rank 0 实际保存文件到磁盘
+   - 使用 FSDP 的 `FULL_STATE_DICT` 模式收集完整参数
+
+2. **加载时**：
+   - 仅 rank 0 从磁盘读取并累积 chunks
+   - 所有 rank 参与 FSDP 的 `load_state_dict` 调用
+   - 参数会自动从 rank 0 广播到其他 ranks
+   - 必须调用 `finalize_fsdp_loading()` 完成加载
+
+3. **核心哲学保留**：
+   - 检查点以 chunks 形式流式加载
+   - 训练可以在加载过程中开始（等待必要的 chunks）
+   - 加载完成后自动切换到正常训练模式
 
 ## 设计说明
 
