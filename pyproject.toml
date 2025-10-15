@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pipelayer"
+version = "0.1.0"
+description = "Pipelined, chunked checkpoint saving and non-blocking state loading pipeline for PyTorch models and optimizers."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+  { name = "GallopLin" }
+]
+keywords = ["pytorch", "checkpoint", "streaming", "pipeline", "cuda", "optimizer", "training"]
+dependencies = [
+  "torch>=1.13"
+]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/GallopLin/pipelayer"
+Repository = "https://github.com/GallopLin/pipelayer"
+Issues = "https://github.com/GallopLin/pipelayer/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 119
+target-version = "py39"
+
+[tool.black]
+line-length = 119
+target-version = ["py39"]

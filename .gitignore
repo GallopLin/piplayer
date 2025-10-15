@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+.build/
+.buildozer/
+*.egg-info/
+.dist/
+dist/
+build/
+.eggs/
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# PyTorch / checkpoints
+*.pt
+*.bin
+*.ckpt
+chkpt/

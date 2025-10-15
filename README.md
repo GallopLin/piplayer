@@ -1,0 +1,103 @@
+# Pipelayer
+
+Pipelayer 提供以下能力：
+- 将 PyTorch 模型与优化器状态分块保存（默认 50MB 为目标 chunk 大小）。
+- 使用独立的 IO 线程与复制工作线程，从 CPU pinned 内存向设备侧（CUDA 或 CPU 回退）进行非阻塞状态加载。
+- 提供 PipelayerModelWrapper 在加载过程中分块等待、逐步可用，加载完成后自动切换到原始 forward。
+
+特性亮点：
+- 面向大模型训练检查点的快启、流水化 IO/拷贝。
+- 优化器状态与参数名对齐，便于恢复优化器。
+- 事件与流的正确同步，避免 CUDA 隐式同步导致的性能回退。
+- CPU 回退路径（无 CUDA 环境也可运行和测试）。
+
+## 安装
+
+该包依赖 PyTorch，请先安装 torch（CPU 或 CUDA 版本，视环境而定）。例如在 CI 或本地 CPU 环境：
+
+```bash
+pip install --upgrade pip
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -e .
+```
+
+> 若你已安装 GPU 版本的 PyTorch，请按官方指引安装对应版本。
+
+## 快速上手
+
+```python
+import torch
+import torch.nn as nn
+from torch.optim import Adam
+from pipelayer.checkpointing import save_model_chunked, PipelinedStateLoader
+from pipelayer.wrapper import PipelayerModelWrapper
+
+# 1) 定义模型与优化器
+model = nn.Sequential(nn.Linear(128, 256), nn.ReLU(), nn.Linear(256, 10))
+opt = Adam(model.parameters(), lr=1e-3)
+
+# 2) 保存分块检查点
+num_chunks = save_model_chunked(model, opt, save_dir="./chkpt", target_chunk_bytes=50 * 1024 * 1024)
+print("Chunks:", num_chunks)
+
+# 3) 恢复时的两种方式：
+
+# 3.a) 直接使用 PipelinedStateLoader 恢复到现有模型与优化器（支持 CPU、CUDA）
+loader = PipelinedStateLoader(model, opt, chkpt_dir="./chkpt", device="cuda:0" if torch.cuda.is_available() else "cpu")
+# 等待所有 chunk 加载完成（也可以在你的 forward 中逐块等待）
+for i in range(loader.num_chunks):
+    if loader.device.type == "cuda":
+        # CUDA: 在当前流上与事件同步
+        loader.wait_for_chunk(i)
+    else:
+        # CPU: 同步事件
+        while not loader.is_chunk_loaded(i):
+            pass
+loader.stop()
+
+# 3.b) 使用 PipelayerModelWrapper，在推理/训练期间渐进可用，加载完成后自动切换到原始 forward
+wrapped = PipelayerModelWrapper(model=nn.Sequential(nn.Linear(128, 256), nn.ReLU(), nn.Linear(256, 10)),
+                                optimizer=Adam(model.parameters(), lr=1e-3),
+                                chkpt_dir="./chkpt",
+                                load_checkpoint=True,
+                                device="cuda:0" if torch.cuda.is_available() else "cpu")
+
+x = torch.randn(4, 128)
+y = wrapped(x)  # 加载过程中会按需等待参数所在 chunk
+```
+
+## 设计说明
+
+- 分块保存：
+  - 先按第一层 prefix（例如 `encoder`, `decoder`）进行分组，保持原语义。
+  - 每个组内按 `target_chunk_bytes` 尺寸阈值切分子 chunk。
+  - 同时保存优化器 `param_groups`（将 `id` 替换为 `name`）和各 chunk 对应的参数名列表的 `metadata.json`。
+
+- 流水加载：
+  - IO 线程顺序读取 chunk，映射到 CPU，pin_memory 后提交至队列。
+  - 多个 copy worker 使用独立 CUDA stream（或 CPU 回退路径）将张量拷贝/设置到目标设备上，更新模型参数和优化器 state。
+  - 使用每个 chunk 对应的事件进行就绪同步，前向执行可按需等待。
+
+- 重要修复：
+  - 原实现将数据复制到 `model.state_dict()[name]` 上不会更新模型，应使用 `named_parameters` 和 `named_buffers` 获取原位引用，进行 `param.data.copy_(...)`。
+
+## 兼容性
+- Python 3.9+
+- torch >= 1.13
+- 支持 CUDA / CPU 回退
+
+## 测试
+
+```bash
+pytest -q
+```
+
+在 CI 中我们安装 CPU 版本的 PyTorch 以保障环境一致性。
+
+## 许可
+
+本项目基于 MIT 许可证发布。详见 [LICENSE](LICENSE)。
+
+## 致谢
+
+- 初始实现与需求来自 GallopLin。
