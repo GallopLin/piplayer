@@ -25,6 +25,8 @@ class PipelayerModelWrapper(nn.Module):
         chkpt_dir: str | None = None,
         load_checkpoint: bool = False,
         device: str | None = None,
+        loader_cls: type[PipelinedStateLoader] = PipelinedStateLoader,
+        loader_kwargs: dict | None = None,
     ) -> None:
         super().__init__()
         self.device = torch.device(device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
@@ -32,6 +34,8 @@ class PipelayerModelWrapper(nn.Module):
         self.optimizer = optimizer
         self.loader: PipelinedStateLoader | None = None
         self.chkpt_dir = chkpt_dir
+        self.loader_cls = loader_cls
+        self.loader_kwargs = loader_kwargs or {}
 
         # 状态管理
         self._loading_complete = threading.Event()
@@ -51,7 +55,13 @@ class PipelayerModelWrapper(nn.Module):
 
     def _initialize_loader(self) -> None:
         """初始化加载器"""
-        self.loader = PipelinedStateLoader(self.original_model, self.optimizer, self.chkpt_dir, device=str(self.device))
+        self.loader = self.loader_cls(
+            self.original_model,
+            self.optimizer,
+            self.chkpt_dir,
+            device=str(self.device),
+            **self.loader_kwargs,
+        )
 
     def _partition_model_blocks(self) -> None:
         if self._use_original_forward:

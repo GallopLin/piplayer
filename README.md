@@ -78,6 +78,34 @@ y = wrapped(x)  # 加载过程中会按需等待参数所在 chunk
   - 多个 copy worker 使用独立 CUDA stream（或 CPU 回退路径）将张量拷贝/设置到目标设备上，更新模型参数和优化器 state。
   - 使用每个 chunk 对应的事件进行就绪同步，前向执行可按需等待。
 
+## 多流检查点加载（multistream）
+
+当检查点使用 multistream 格式保存（单个文件中包含多个 checkpoint），可以使用新的 `MultiStreamStateLoader` 进行流水加载：
+
+```python
+from pipelayer.checkpointing import MultiStreamStateLoader
+
+loader = MultiStreamStateLoader(
+  model,
+  optimizer,
+  chkpt_dir="/path/to/chkpt_dir",
+  lib_path="/path/to/libtest_ssd.so",
+  metadata_file="checkpoint.chk.metadata.json",
+  checkpoint_file="checkpoint.chk",
+  device="cuda:0",
+  load_grad=False,
+)
+
+for i in range(loader.num_chunks):
+  loader.wait_for_chunk(i)
+loader.stop()
+```
+
+说明：
+- `metadata_file` 来自 multistream 保存端导出的元数据文件（包含 stream offsets 和 layer group 切分信息）。
+- `checkpoint_file` 为 multistream 的 checkpoint 文件。
+- 若要使用 `PipelayerModelWrapper`，可传入 `loader_cls=MultiStreamStateLoader` 及 `loader_kwargs`。
+
 - 重要修复：
   - 原实现将数据复制到 `model.state_dict()[name]` 上不会更新模型，应使用 `named_parameters` 和 `named_buffers` 获取原位引用，进行 `param.data.copy_(...)`。
 
@@ -89,7 +117,39 @@ y = wrapped(x)  # 加载过程中会按需等待参数所在 chunk
 ## 测试
 
 ```bash
-pytest -q
+// 检查点恢复
+python3.9 /home/linzhicheng/download/pipelayer/examples/run_clm_pipelayer2.py \
+    --model_name_or_path facebook/opt-1.3b \
+    --output_dir /home/linzhicheng/download/ckpt \
+    --dataset_name wikitext \
+    --dataset_config_name wikitext-2-raw-v1 \
+    --per_device_train_batch_size 1 \
+    --use_pipelayer \
+    --pipelayer_loader multistream \
+    --multistream_lib_path /home/linzhicheng/code/pccheck/checkpoint_eval/pccheck/libtest_ssd.so \
+    --multistream_checkpoint_file /home/linzhicheng/multistream_checkpoint.chk \
+    --multistream_metadata_file /home/linzhicheng/multistream_checkpoint.chk.metadata.json \
+    --resume_from_checkpoint dummy_resume/step_1 \
+    --overwrite_output_dir \
+    --max_train_steps 5 
+
+// 检查点保存
+python3.9 /home/linzhicheng/code/transformers/examples/pytorch/language-modeling/run_clm_multistream.py \
+    --model_name_or_path facebook/opt-1.3b \
+    --output_dir /home/linzhicheng/download/ckpt \
+    --dataset_name wikitext \
+    --dataset_config_name wikitext-2-raw-v1 \
+    --do_train \
+    --per_device_train_batch_size 1 \
+    --max_async 2 \
+    --num_threads 2 \
+    --num_layer_groups 6 \
+    --cfreq 50 \
+    --bench_total_steps 100 \
+    --c_lib_path /home/linzhicheng/code/pccheck/checkpoint_eval/pccheck/libtest_ssd.so \
+    --multistream_checkpoint_file multistream_test.chk \
+    --overwrite_output_dir \
+    --multistream_metadata_file multistream_test.chk.metadata.json
 ```
 
 在 CI 中我们安装 CPU 版本的 PyTorch 以保障环境一致性。

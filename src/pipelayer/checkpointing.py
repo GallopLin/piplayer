@@ -10,6 +10,8 @@ import time
 from collections import defaultdict
 from typing import Dict, Any, List, Optional
 
+from ctypes import cdll, c_void_p, c_char_p, c_int, c_size_t, POINTER
+
 import torch
 import torch.nn as nn
 
@@ -189,7 +191,12 @@ class PipelinedStateLoader:
         self.optimizer = optimizer
         self.chkpt_dir = chkpt_dir
         self.device = torch.device(device)
-        self.model.to(self.device)
+        # 注意：model 通常已由 PipelayerModelWrapper 移动到目标设备
+        # 此处仅检查而非强制移动，避免冗余操作
+        if next(model.parameters(), None) is not None:
+            model_device = next(model.parameters()).device
+            if model_device != self.device:
+                self.model.to(self.device)
 
         with open(os.path.join(chkpt_dir, "metadata.json"), "r", encoding="utf-8") as f:
             self.metadata = json.load(f)
@@ -409,3 +416,343 @@ class PipelinedStateLoader:
 
     def debug_stats(self) -> None:
         print(f"[Loader Stats] Queue Size: {self.host_buffer_queue.qsize()}, CopyWorkers: {self.num_copy_workers}")
+
+
+class MultiStreamStateLoader:
+    """
+    基于 multistream 格式的流水加载器（C++ mmap 读取 + Python pipeline）。
+
+    - C++ 侧负责 mmap + 按 stream/offset 拷贝到 CPU pinned buffer。
+    - Python 侧负责异步拷贝到 device，并原位更新参数与优化器状态。
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        chkpt_dir: str,
+        lib_path: str,
+        checkpoint_file: Optional[str] = None,
+        metadata_file: str = "multistream_metadata.json",
+        device: str = "cuda:0",
+        host_queue_maxsize: int = 32,
+        num_copy_workers: Optional[int] = None,
+        load_grad: bool = False,
+        parall_iter: Optional[int] = None,
+    ) -> None:
+        self.model = model
+        self.optimizer = optimizer
+        self.chkpt_dir = chkpt_dir
+        self.device = torch.device(device)
+        # 注意：model 通常已由 PipelayerModelWrapper 移动到目标设备
+        # 此处仅检查而非强制移动，避免冗余操作
+        if next(model.parameters(), None) is not None:
+            model_device = next(model.parameters()).device
+            if model_device != self.device:
+                self.model.to(self.device)
+        self.load_grad = load_grad
+
+        metadata_path = metadata_file
+        if not os.path.isabs(metadata_path):
+            metadata_path = os.path.join(chkpt_dir, metadata_path)
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            self.metadata = json.load(f)
+
+        self.num_chunks = int(self.metadata["num_chunks"])
+        self.stream_names: List[str] = list(self.metadata.get("stream_names", ["param", "grad", "exp_avg", "exp_avg_sq"]))
+        self.stream_sizes: List[int] = [int(x) for x in self.metadata.get("stream_sizes", [])]
+        self.max_async = int(self.metadata.get("max_async", 1))
+
+        if checkpoint_file is None:
+            checkpoint_file = self.metadata.get("checkpoint_file")
+        if checkpoint_file is None:
+            raise ValueError("checkpoint_file is required (not found in metadata).")
+        if not os.path.isabs(checkpoint_file):
+            checkpoint_file = os.path.join(chkpt_dir, checkpoint_file)
+        self.checkpoint_file = checkpoint_file
+
+        # 参数与 buffer 名 -> 张量映射（用于原位写入）
+        self.param_name_to_tensor: Dict[str, nn.Parameter] = {name: p for name, p in self.model.named_parameters()}
+        self.buffer_name_to_tensor: Dict[str, torch.Tensor] = {name: b for name, b in self.model.named_buffers()}
+
+        # param_name -> chunk_idx
+        self.param_name_to_chunk: Dict[str, int] = {}
+        for cid, meta in self.metadata.get("chunks", {}).items():
+            ic = int(cid)
+            for pinfo in meta.get("params", []):
+                pname = pinfo.get("name")
+                if pname:
+                    self.param_name_to_chunk[pname] = ic
+
+        # 加载 optimizer param groups（若提供）
+        self._load_optimizer_param_groups()
+        self.optimizer_steps: Dict[str, int] = self.metadata.get("optimizer_steps", {})
+        
+        # 验证 optimizer step 一致性，并计算全局 step
+        self.global_optimizer_step: Optional[int] = self._validate_and_get_global_step()
+
+        if num_copy_workers is None:
+            num_copy_workers = 1
+        self.num_copy_workers = int(num_copy_workers)
+
+        self._init_device_primitives()
+        self._init_reader(lib_path)
+
+        # 优先从 metadata 读取 latest_parall_iter，避免调用可能崩溃的 C++ 接口
+        if parall_iter is None:
+            parall_iter = self.metadata.get("latest_parall_iter")
+        if parall_iter is None:
+            # C++ 的 get_latest_parall_iter 存在段错误风险，直接默认使用 0
+            # 对于旧版本 metadata（没有 latest_parall_iter 字段），使用 0 是安全的
+            print("[WARN] latest_parall_iter not found in metadata, defaulting to 0")
+            parall_iter = 0
+        self.parall_iter = int(parall_iter)
+        print(f"[MultiStreamStateLoader] Using parall_iter={self.parall_iter}")
+
+        self.host_buffer_queue: "queue.Queue[Any]" = queue.Queue(maxsize=host_queue_maxsize)
+        self.producer_stop_event = threading.Event()
+        self.copy_worker_stop_event = threading.Event()
+
+        self._producer_thread = threading.Thread(target=self._io_producer_loop, daemon=True)
+        self._copy_worker_threads: List[threading.Thread] = []
+        self._producer_thread.start()
+        for i in range(self.num_copy_workers):
+            t = threading.Thread(target=self._copy_worker_loop, args=(i,), daemon=True)
+            t.start()
+            self._copy_worker_threads.append(t)
+
+        atexit.register(self.stop)
+
+    def _init_reader(self, lib_path: str) -> None:
+        self.lib = cdll.LoadLibrary(lib_path)
+
+        self.lib.reader.restype = c_void_p
+        self.lib.reader.argtypes = [c_char_p, c_int]
+
+        self.lib.init_streams.restype = c_int
+        self.lib.init_streams.argtypes = [c_void_p, c_int, POINTER(c_size_t)]
+
+        self.lib.read_stream_chunk.restype = None
+        self.lib.read_stream_chunk.argtypes = [c_void_p, c_int, c_void_p, c_size_t, c_size_t, c_int]
+
+        self.lib.get_latest_parall_iter.restype = c_int
+        self.lib.get_latest_parall_iter.argtypes = [c_void_p]
+
+        self.lib.close_writer.restype = None
+        self.lib.close_writer.argtypes = [c_void_p]
+
+        self.reader_obj = self.lib.reader(self.checkpoint_file.encode("utf-8"), int(self.max_async))
+
+        if self.stream_sizes:
+            stream_sizes_arr = (c_size_t * len(self.stream_sizes))(*self.stream_sizes)
+            ret = self.lib.init_streams(self.reader_obj, int(len(self.stream_sizes)), stream_sizes_arr)
+            if ret != 0:
+                raise RuntimeError("Failed to initialize streams in multistream reader")
+
+    def _init_device_primitives(self) -> None:
+        if self.device.type == "cuda":
+            with torch.cuda.device(self.device):
+                self.copy_streams = [torch.cuda.Stream() for _ in range(self.num_copy_workers)]
+                self.events = [torch.cuda.Event(enable_timing=False) for _ in range(self.num_chunks)]
+        else:
+            self.copy_streams = [None for _ in range(self.num_copy_workers)]
+            self.events = [threading.Event() for _ in range(self.num_chunks)]
+
+    def _load_optimizer_param_groups(self) -> None:
+        groups = self.metadata.get("optimizer_param_groups")
+        if not groups:
+            return
+        new_param_groups = []
+        for group in groups:
+            new_group = dict(group)
+            new_params = []
+            for pname in group.get("params", []):
+                if pname in self.param_name_to_tensor:
+                    new_params.append(self.param_name_to_tensor[pname])
+            new_group["params"] = new_params
+            if new_group["params"]:
+                new_param_groups.append(new_group)
+        if new_param_groups:
+            self.optimizer.param_groups = new_param_groups
+            self.optimizer.state = {}
+
+    def _validate_and_get_global_step(self) -> Optional[int]:
+        """
+        获取全局 optimizer step 值。
+        
+        性能优先：直接取第一个 step 值，假设保存侧已保证一致性。
+        正常训练流程中所有参数的 step 始终一致。
+        """
+        if not self.optimizer_steps:
+            return None
+        # O(1) 取任意一个值即可
+        return next(iter(self.optimizer_steps.values()))
+
+    def _io_producer_loop(self) -> None:
+        try:
+            for i in range(self.num_chunks):
+                if self.producer_stop_event.is_set():
+                    break
+                chunk_meta = self.metadata["chunks"][str(i)]
+                pinned_buffers: Dict[str, torch.Tensor] = {}
+
+                for stream_idx, stream_name in enumerate(self.stream_names):
+                    if stream_name == "grad" and not self.load_grad:
+                        continue
+                    slice_info = chunk_meta.get("stream_slices", {}).get(stream_name)
+                    if not slice_info or slice_info.get("size", 0) == 0:
+                        continue
+                    size = int(slice_info["size"])
+                    offset = int(slice_info["offset"])
+                    buffer = torch.empty(size, dtype=torch.float32, pin_memory=True)
+                    self.lib.read_stream_chunk(
+                        self.reader_obj,
+                        int(stream_idx),
+                        c_void_p(buffer.data_ptr()),
+                        c_size_t(offset),
+                        c_size_t(size),
+                        c_int(self.parall_iter),
+                    )
+                    pinned_buffers[stream_name] = buffer
+
+                self.host_buffer_queue.put((i, pinned_buffers, chunk_meta))
+        except Exception as e:
+            print(f"[ERROR] MultiStream producer error: {e}")
+            self.producer_stop_event.set()
+
+    def _copy_worker_loop(self, worker_idx: int) -> None:
+        stream = self.copy_streams[worker_idx]
+        try:
+            if self.device.type == "cuda":
+                with torch.cuda.device(self.device):
+                    self._copy_worker_loop_impl(worker_idx, stream)  # type: ignore[arg-type]
+            else:
+                self._copy_worker_loop_impl(worker_idx, stream=None)
+        except Exception as e:
+            print(f"[ERROR] MultiStream copy worker error (idx={worker_idx}): {e}")
+            self.copy_worker_stop_event.set()
+
+    def _copy_worker_loop_impl(self, worker_idx: int, stream: Optional["torch.cuda.Stream"]) -> None:  # type: ignore[name-defined]
+        while not (self.copy_worker_stop_event.is_set() and self.host_buffer_queue.empty()):
+            try:
+                item = self.host_buffer_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item is None:
+                self.host_buffer_queue.task_done()
+                break
+            chunk_idx, buffers, chunk_meta = item
+            try:
+                if self.device.type == "cuda":
+                    assert stream is not None
+                    with torch.cuda.stream(stream):
+                        self._apply_multistream_chunk(buffers, chunk_meta)
+                        self.events[chunk_idx].record(stream)  # type: ignore[union-attr]
+                else:
+                    self._apply_multistream_chunk(buffers, chunk_meta)
+                    self.events[chunk_idx].set()  # type: ignore[union-attr]
+            finally:
+                self.host_buffer_queue.task_done()
+
+    def _apply_multistream_chunk(self, buffers: Dict[str, torch.Tensor], chunk_meta: Dict[str, Any]) -> None:
+        for pinfo in chunk_meta.get("params", []):
+            name = pinfo.get("name")
+            if not name or name not in self.param_name_to_tensor:
+                continue
+            param = self.param_name_to_tensor[name]
+            numel = int(pinfo.get("numel", param.numel()))
+            offsets = pinfo.get("offsets_in_chunk", {})
+            dtype = param.dtype
+            non_blocking = self.device.type == "cuda"
+
+            if "param" in buffers and "param" in offsets:
+                start = int(offsets["param"])
+                host_view = buffers["param"][start:start + numel].view(param.shape)
+                param.data.copy_(host_view.to(self.device, dtype=dtype, non_blocking=non_blocking))
+
+            if self.load_grad and "grad" in buffers and "grad" in offsets:
+                start = int(offsets["grad"])
+                host_view = buffers["grad"][start:start + numel].view(param.shape)
+                if param.grad is None:
+                    param.grad = torch.zeros_like(param)
+                param.grad.data.copy_(host_view.to(self.device, dtype=dtype, non_blocking=non_blocking))
+
+            # optimizer state: exp_avg / exp_avg_sq
+            state = self.optimizer.state.setdefault(param, {})
+            if "exp_avg" in buffers and "exp_avg" in offsets:
+                start = int(offsets["exp_avg"])
+                host_view = buffers["exp_avg"][start:start + numel].view(param.shape)
+                if isinstance(state.get("exp_avg"), torch.Tensor):
+                    state["exp_avg"].data.copy_(host_view.to(self.device, dtype=dtype, non_blocking=non_blocking))
+                else:
+                    state["exp_avg"] = host_view.to(self.device, dtype=dtype, non_blocking=non_blocking)
+
+            if "exp_avg_sq" in buffers and "exp_avg_sq" in offsets:
+                start = int(offsets["exp_avg_sq"])
+                host_view = buffers["exp_avg_sq"][start:start + numel].view(param.shape)
+                if isinstance(state.get("exp_avg_sq"), torch.Tensor):
+                    state["exp_avg_sq"].data.copy_(host_view.to(self.device, dtype=dtype, non_blocking=non_blocking))
+                else:
+                    state["exp_avg_sq"] = host_view.to(self.device, dtype=dtype, non_blocking=non_blocking)
+
+            # restore optimizer step - 使用经过一致性验证的 step 值
+            if self.global_optimizer_step is not None:
+                state["step"] = torch.tensor(self.global_optimizer_step)
+            elif name in self.optimizer_steps:
+                state["step"] = torch.tensor(self.optimizer_steps[name])
+
+    def stop(self) -> None:
+        self.producer_stop_event.set()
+        self.copy_worker_stop_event.set()
+        for _ in range(self.num_copy_workers + 2):
+            try:
+                self.host_buffer_queue.put_nowait(None)
+            except queue.Full:
+                break
+
+        if hasattr(self, "_producer_thread") and self._producer_thread.is_alive():
+            self._producer_thread.join(timeout=2.0)
+        for t in getattr(self, "_copy_worker_threads", []):
+            if t.is_alive():
+                t.join(timeout=2.0)
+
+        if getattr(self, "reader_obj", None) is not None:
+            pass
+            # try:
+            #     self.lib.close_writer(self.reader_obj)
+            # except Exception:
+            #     pass
+
+        if self.device.type == "cuda":
+            with torch.cuda.device(self.device):
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
+        while not self.host_buffer_queue.empty():
+            try:
+                self.host_buffer_queue.get_nowait()
+                self.host_buffer_queue.task_done()
+            except queue.Empty:
+                break
+
+    def wait_for_chunk(self, chunk_idx: int) -> None:
+        if 0 <= chunk_idx < self.num_chunks:
+            if self.device.type == "cuda":
+                with torch.cuda.device(self.device):
+                    torch.cuda.current_stream().wait_event(self.events[chunk_idx])  # type: ignore[arg-type]
+            else:
+                self.events[chunk_idx].wait()  # type: ignore[union-attr]
+
+    def is_chunk_loaded(self, chunk_idx: int) -> bool:
+        if 0 <= chunk_idx < self.num_chunks:
+            if self.device.type == "cuda":
+                return bool(self.events[chunk_idx].query())  # type: ignore[union-attr]
+            else:
+                return bool(self.events[chunk_idx].is_set())  # type: ignore[union-attr]
+        return False
+
+    def __del__(self) -> None:
+        try:
+            self.stop()
+        except Exception:
+            pass
