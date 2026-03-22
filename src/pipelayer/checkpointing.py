@@ -280,20 +280,20 @@ class PipelinedStateLoader:
                 chunk_path = os.path.join(self.chkpt_dir, fname)
                 chunk_data = torch.load(chunk_path, map_location="cpu", weights_only=False)
 
-                # pin model tensors
+                # pin model tensors (only if CUDA is available)
                 pinned_model = {}
                 for k, v in chunk_data["model"].items():
-                    if isinstance(v, torch.Tensor):
+                    if isinstance(v, torch.Tensor) and torch.cuda.is_available():
                         pinned_model[k] = v.pin_memory()
                     else:
                         pinned_model[k] = v
 
                 optim_states = chunk_data.get("optimizer_states", {})
 
-                # pin optimizer tensor states too
+                # pin optimizer tensor states too (only if CUDA is available)
                 for param_name, state in optim_states.items():
                     for state_name, tensor in list(state.items()):
-                        if isinstance(tensor, torch.Tensor):
+                        if isinstance(tensor, torch.Tensor) and torch.cuda.is_available():
                             state[state_name] = tensor.pin_memory()
 
                 # push to queue
